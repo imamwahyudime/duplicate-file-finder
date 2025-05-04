@@ -23,18 +23,24 @@ except ImportError:
 
 
 # --- Configuration ---
-APP_VERSION = "1.2.0" # Incremented version for clickable links
-CHUNK_SIZE = 65536    # Read files in 64KB chunks for hashing
-TOOLTIP_DELAY = 600   # Milliseconds before tooltip appears
+APP_VERSION = "1.3.0" # Incremented version for stop button feature
+# *** Change 1: Define fixed release date ***
+APP_RELEASE_DATE = "2025-05-01 (Thursday)"
+CHUNK_SIZE = 65536      # Read files in 64KB chunks for hashing
+TOOLTIP_DELAY = 600     # Milliseconds before tooltip appears
 
 
 # --- Core Logic ---
-def calculate_hash(filepath, progress_queue=None, file_index=0, total_files=1):
-    """Calculates the SHA-256 hash of a file, reporting progress."""
+def calculate_hash(filepath, stop_event, progress_queue=None, file_index=0, total_files=1):
+    """Calculates the SHA-256 hash of a file, reporting progress and checking for stop signal."""
     hasher = hashlib.sha256()
     try:
         with open(filepath, 'rb') as file:
             while True:
+                # *** Change 2: Check stop event during file read ***
+                if stop_event.is_set():
+                    return "STOPPED" # Signal that hashing was interrupted
+
                 chunk = file.read(CHUNK_SIZE)
                 if not chunk:
                     break
@@ -46,12 +52,16 @@ def calculate_hash(filepath, progress_queue=None, file_index=0, total_files=1):
             progress_queue.put({"type": "status", "message": f"Warn: Cannot hash {os.path.basename(filepath)}: {e}"}) # Changed to status warn # noqa E701
         return None
 
-def find_duplicate_files_thread(directory_to_scan, scan_subfolders, progress_queue):
+# *** Change 3: Add stop_event parameter ***
+def find_duplicate_files_thread(directory_to_scan, scan_subfolders, progress_queue, stop_event):
     """
     Finds duplicate files based on size and then hash.
     Runs in a separate thread and reports progress via a queue.
+    Checks for a stop event periodically.
     """
     try:
+        # --- Initial Checks ---
+        if stop_event.is_set(): return # Check before starting
         if not os.path.isdir(directory_to_scan):
             progress_queue.put({"type": "error", "message": f"Directory not found: {directory_to_scan}"})
             progress_queue.put({"type": "finished"})
@@ -65,27 +75,41 @@ def find_duplicate_files_thread(directory_to_scan, scan_subfolders, progress_que
         if scan_subfolders:
             progress_queue.put({"type":"status", "message": f"{status_msg_prefix} (including subfolders)..."})
             # Use scandir for potentially better performance, handle errors gracefully
-            for entry in os.scandir(directory_to_scan):
-                try:
-                    if entry.is_dir():
-                         # Walk through subdirectories
-                         for root, _, filenames in os.walk(entry.path):
-                            for filename in filenames:
-                                filepath = os.path.join(root, filename)
-                                try:
-                                    # Check if it's a regular file and not a symlink
-                                    if os.path.isfile(filepath) and not os.path.islink(filepath):
-                                        all_files_to_scan.append(filepath)
-                                except OSError as e_inner:
-                                    progress_queue.put({"type": "status", "message": f"Warn: Cannot access {filepath}: {e_inner}"}) # noqa E701
-                    elif entry.is_file() and not entry.is_symlink():
-                        all_files_to_scan.append(entry.path)
-                except OSError as e_outer:
-                     progress_queue.put({"type": "status", "message": f"Warn: Cannot access {entry.path}: {e_outer}"}) # noqa E701
-        else:
+            # Wrap directory iteration in try...except for top-level access errors
+            try:
+                for entry in os.scandir(directory_to_scan):
+                    # *** Change 4: Check stop event in outer loop ***
+                    if stop_event.is_set(): return
+
+                    try:
+                        if entry.is_dir():
+                            # Walk through subdirectories
+                            for root, _, filenames in os.walk(entry.path, topdown=True): # Use topdown=True
+                                # *** Change 5: Check stop event in inner loop (walk) ***
+                                if stop_event.is_set(): return
+                                for filename in filenames:
+                                    if stop_event.is_set(): return # Check frequently
+                                    filepath = os.path.join(root, filename)
+                                    try:
+                                        # Check if it's a regular file and not a symlink
+                                        if os.path.isfile(filepath) and not os.path.islink(filepath):
+                                            all_files_to_scan.append(filepath)
+                                    except OSError as e_inner:
+                                        progress_queue.put({"type": "status", "message": f"Warn: Cannot access {filepath}: {e_inner}"}) # noqa E701
+                        elif entry.is_file() and not entry.is_symlink():
+                            all_files_to_scan.append(entry.path)
+                    except OSError as e_outer:
+                        progress_queue.put({"type": "status", "message": f"Warn: Cannot access {entry.path}: {e_outer}"}) # noqa E701
+            except OSError as e_scan: # Catch errors scanning the top directory
+                progress_queue.put({"type": "error", "message": f"Error scanning directory {directory_to_scan}: {e_scan}"})
+                progress_queue.put({"type": "finished"})
+                return
+        else: # Scan top-level only
             progress_queue.put({"type":"status", "message": f"{status_msg_prefix} (top-level only)..."})
             try:
                 for entry in os.scandir(directory_to_scan):
+                    # *** Change 6: Check stop event in non-recursive loop ***
+                    if stop_event.is_set(): return
                     try:
                         # Check if it's a regular file and not a symlink in the top level
                         if entry.is_file() and not entry.is_symlink():
@@ -98,23 +122,24 @@ def find_duplicate_files_thread(directory_to_scan, scan_subfolders, progress_que
                 return
 
         total_files_found = len(all_files_to_scan)
-        if total_files_found == 0:
+        if total_files_found == 0 and not stop_event.is_set(): # Only report 'no files' if not stopped
             progress_queue.put({"type": "status", "message": "No files found to scan."})
             progress_queue.put({"type": "result", "data": {}}) # Send empty result
             progress_queue.put({"type": "finished"})
             return
 
         # --- Step 1: Group by size ---
+        if stop_event.is_set(): return # Check before next step
         progress_queue.put({"type": "status", "message": f"Found {total_files_found} files. Step 2/3: Grouping by size..."}) # noqa E701
         files_by_size = collections.defaultdict(list)
         total_files_processed_size = 0
-        # Update progress more frequently for large numbers of files
         update_interval_size = max(1, total_files_found // 100 if total_files_found > 100 else 10)
-        for filepath in all_files_to_scan:
+        for i, filepath in enumerate(all_files_to_scan):
+            # *** Change 7: Check stop event during size grouping ***
+            if stop_event.is_set(): return
             try:
                 filesize = os.path.getsize(filepath)
-                # Only consider files with size > 0 for duplication
-                if filesize > 0:
+                if filesize > 0: # Only consider files with size > 0
                     files_by_size[filesize].append(filepath)
             except OSError as e:
                 progress_queue.put({"type": "status", "message": f"Warn: Cannot get size for {os.path.basename(filepath)}: {e}"}) # noqa E701
@@ -124,10 +149,10 @@ def find_duplicate_files_thread(directory_to_scan, scan_subfolders, progress_que
                 progress_queue.put({"type": "progress", "value": progress})
 
         # --- Step 2: Calculate Hashes for potential duplicates ---
+        if stop_event.is_set(): return # Check before hashing
         progress_queue.put({"type": "progress", "value": 33.3}) # Mark end of size grouping
         progress_queue.put({"type": "status", "message": "Step 3/3: Calculating hashes..."})
         files_by_hash = collections.defaultdict(list)
-        # Flatten the list of files that have potential size duplicates
         potential_duplicates_paths = [
             fp for size, fps in files_by_size.items() if len(fps) > 1 for fp in fps
         ]
@@ -135,28 +160,36 @@ def find_duplicate_files_thread(directory_to_scan, scan_subfolders, progress_que
         hashed_count = 0
         update_interval_hash = max(1, total_to_hash // 100 if total_to_hash > 100 else 10)
 
-        if total_to_hash == 0:
+        if total_to_hash == 0 and not stop_event.is_set():
             progress_queue.put({"type": "status", "message": "No potential duplicates found based on size."})
-        else:
-            progress_queue.put({"type": "status", "message": f"Hashing {total_to_hash} potential duplicate files..."}) # noqa E701
+        elif not stop_event.is_set():
+             progress_queue.put({"type": "status", "message": f"Hashing {total_to_hash} potential duplicate files..."}) # noqa E701
 
         for i, filepath in enumerate(potential_duplicates_paths):
-            file_hash = calculate_hash(filepath, progress_queue, i, total_to_hash)
+            # *** Change 8: Check stop event before hashing each file ***
+            if stop_event.is_set(): return
+            # *** Change 9: Pass stop_event to calculate_hash ***
+            file_hash = calculate_hash(filepath, stop_event, progress_queue, i, total_to_hash)
+
+            # *** Change 10: Handle "STOPPED" signal from calculate_hash ***
+            if file_hash == "STOPPED":
+                return # Stop requested during hashing of this file
+
             if file_hash:
                 files_by_hash[file_hash].append(filepath)
+
             hashed_count += 1
             if total_to_hash > 0 and hashed_count % update_interval_hash == 0:
                 progress = 33.3 + (hashed_count / total_to_hash) * 66.6 # Progress within Step 2 (33.3-100%)
                 progress_queue.put({"type": "progress", "value": progress})
 
-
         # --- Step 3: Identify actual duplicate sets ---
+        if stop_event.is_set(): return # Check before final step
         progress_queue.put({"type": "progress", "value": 99.9}) # Almost done
         progress_queue.put({"type": "status", "message": "Identifying duplicate sets..."})
         duplicates_found = collections.defaultdict(list)
         for file_hash, filepaths in files_by_hash.items():
             if len(filepaths) > 1:
-                # Sort paths within each set for consistent display
                 duplicates_found[file_hash] = sorted(filepaths)
 
         # --- Final Report ---
@@ -165,18 +198,27 @@ def find_duplicate_files_thread(directory_to_scan, scan_subfolders, progress_que
         num_sets = len(duplicates_found)
         num_files = sum(len(fps) for fps in duplicates_found.values())
         if num_sets > 0:
-             final_message = f"Scan complete. Found {num_sets} duplicate set(s) involving {num_files} files."
+            final_message = f"Scan complete. Found {num_sets} duplicate set(s) involving {num_files} files."
         else:
-             final_message = "Scan complete. No duplicates found."
+            final_message = "Scan complete. No duplicates found."
         progress_queue.put({"type": "status", "message": final_message})
 
     except Exception as e:
         # Catch unexpected errors during the scan process
-        progress_queue.put({"type": "error", "message": f"An unexpected error occurred during scan: {e}"}) # noqa E701
-        import traceback
-        traceback.print_exc(file=sys.stderr) # Log the full traceback for debugging
+        # Check if stop was requested *before* the exception occurred
+        if not stop_event.is_set():
+            progress_queue.put({"type": "error", "message": f"An unexpected error occurred during scan: {e}"}) # noqa E701
+            import traceback
+            traceback.print_exc(file=sys.stderr) # Log the full traceback for debugging
+        # Else, if stop was requested, the stop message takes precedence
+
     finally:
-        # Always signal completion
+        # *** Change 11: Check if stopped and send appropriate message if necessary ***
+        if stop_event.is_set():
+             # Make sure a stop message is sent if the thread exits due to the flag
+             progress_queue.put({"type": "status", "message": "Scan stopped by user."})
+
+        # Always signal completion, regardless of how the thread exits
         progress_queue.put({"type": "finished"})
 
 
@@ -202,8 +244,10 @@ class DuplicateFinderApp:
         self.scan_subfolders_var = tk.BooleanVar(value=True)
         self.duplicates_data = {} # Stores the found duplicate sets {hash: [path1, path2,...]}
         self.tree_item_to_path = {} # Maps treeview item IDs to full file paths
-        self.scan_thread = None     # Holds the background scanning thread
+        self.scan_thread = None      # Holds the background scanning thread
         self.progress_queue = queue.Queue() # Queue for thread communication
+        # *** Change 12: Add threading event for stopping scan ***
+        self.stop_scan_event = threading.Event()
 
         # Tooltip related variables
         self.tooltip_window = None
@@ -233,21 +277,25 @@ class DuplicateFinderApp:
         self.subfolder_check = ttk.Checkbutton(self.top_frame, text="Scan Subfolders", variable=self.scan_subfolders_var) # noqa E701
         self.subfolder_check.grid(row=0, column=4, padx=(10, 0))
 
-        # --- Middle Frame (Status Label & Progress Bar) ---
+        # --- Middle Frame (Status Label, Progress Bar & Stop Button) ---
         self.middle_frame = ttk.Frame(root, padding=(10, 5, 10, 10))
         self.middle_frame.pack(fill=tk.X, side=tk.TOP)
         self.middle_frame.columnconfigure(0, weight=1) # Status label expands
 
         self.status_label = ttk.Label(self.middle_frame, text="Ready.", anchor="w")
-        self.status_label.grid(row=0, column=0, sticky="ew")
+        self.status_label.grid(row=0, column=0, sticky="ew", padx=(0, 5))
         self.progress_bar = ttk.Progressbar(self.middle_frame, orient="horizontal", length=200, mode="determinate") # noqa E701
-        self.progress_bar.grid(row=0, column=1, padx=(10,0))
+        self.progress_bar.grid(row=0, column=1, padx=(5,5))
+        # *** Change 13: Add Stop Button ***
+        self.stop_button = ttk.Button(self.middle_frame, text="Stop", command=self.request_stop_scan, state=tk.DISABLED)
+        self.stop_button.grid(row=0, column=2, padx=(5,0))
+
 
         # --- Bottom Frame (Results Treeview & Action Buttons) ---
         self.bottom_frame = ttk.Frame(root, padding=(10, 0, 10, 10))
         self.bottom_frame.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
         self.bottom_frame.columnconfigure(0, weight=1) # Treeview area expands
-        self.bottom_frame.rowconfigure(0, weight=1)    # Treeview area expands
+        self.bottom_frame.rowconfigure(0, weight=1)     # Treeview area expands
 
         # Treeview Frame (contains tree and scrollbars)
         self.tree_frame = ttk.Frame(self.bottom_frame)
@@ -287,7 +335,7 @@ class DuplicateFinderApp:
 
         # Bind Events to Treeview
         self.tree.bind('<Enter>', self.schedule_tooltip) # Mouse enters treeview area
-        self.tree.bind('<Leave>', self.hide_tooltip)   # Mouse leaves treeview area
+        self.tree.bind('<Leave>', self.hide_tooltip)     # Mouse leaves treeview area
         self.tree.bind('<Motion>', self.schedule_tooltip) # Mouse moves within treeview
         self.tree.bind('<Double-Button-1>', self.open_file_for_event) # Double left-click
         self.tree.bind('<Button-3>', self.show_context_menu) # Right-click
@@ -345,17 +393,31 @@ class DuplicateFinderApp:
     def set_ui_state(self, state):
         """Enables or disables UI elements during scanning."""
         tk_state = tk.DISABLED if state == 'disabled' else tk.NORMAL
+        scan_running = (state == 'disabled')
+
         # Disable/enable input elements
         self.dir_entry.config(state=tk_state)
         self.browse_button.config(state=tk_state)
         self.scan_button.config(state=tk_state)
         self.subfolder_check.config(state=tk_state)
+
+        # *** Change 14: Manage Stop Button state ***
+        self.stop_button.config(state=tk.NORMAL if scan_running else tk.DISABLED)
+
         # Always disable action buttons when scan starts
-        if state == 'disabled':
+        if scan_running:
             self.delete_button.config(state='disabled')
             self.trash_button.config(state='disabled')
             self.move_button.config(state='disabled')
-        # Note: Buttons are re-enabled based on results in check_queue's "finished" handler
+        # Note: Action buttons are re-enabled based on results in check_queue's "finished" handler
+
+    # *** Change 15: Add method to request stop ***
+    def request_stop_scan(self):
+        """Signals the background thread to stop scanning."""
+        if self.scan_thread and self.scan_thread.is_alive():
+            self.stop_scan_event.set() # Set the event flag
+            self.stop_button.config(state=tk.DISABLED) # Disable stop button immediately
+            self.status_label.config(text="Stopping scan...") # Provide feedback
 
     def start_scan(self):
         """Starts the duplicate file scan in a background thread."""
@@ -365,11 +427,13 @@ class DuplicateFinderApp:
             return
         # Prevent starting multiple scans concurrently
         if self.scan_thread and self.scan_thread.is_alive():
-            messagebox.showwarning("Scan in Progress", "A scan is already running. Please wait.", parent=self.root) # noqa E701
+            messagebox.showwarning("Scan in Progress", "A scan is already running. Please wait or stop the current scan.", parent=self.root) # noqa E701
             return
 
         self.clear_results()
-        self.set_ui_state('disabled') # Disable UI during scan
+        # *** Change 16: Clear stop event before starting ***
+        self.stop_scan_event.clear()
+        self.set_ui_state('disabled') # Disable UI during scan, enable Stop button
         self.status_label.config(text="Starting scan...")
         self.progress_bar['value'] = 0
         self.root.update_idletasks() # Ensure UI updates before thread starts
@@ -378,7 +442,8 @@ class DuplicateFinderApp:
         # Create and start the background thread
         self.scan_thread = threading.Thread(
             target=find_duplicate_files_thread,
-            args=(dir_path, scan_subs, self.progress_queue),
+            # *** Change 17: Pass stop_event to the thread target ***
+            args=(dir_path, scan_subs, self.progress_queue, self.stop_scan_event),
             daemon=True # Allows the app to exit even if the thread is running
         )
         self.scan_thread.start()
@@ -391,37 +456,57 @@ class DuplicateFinderApp:
                 msg_type = message.get("type")
 
                 if msg_type == "status":
-                    self.status_label.config(text=message.get("message", "..."))
+                    # Avoid overwriting "Stopping..." message if user clicked Stop
+                    if not (self.stop_scan_event.is_set() and self.status_label.cget("text") == "Stopping scan..."):
+                         self.status_label.config(text=message.get("message", "..."))
                 elif msg_type == "progress":
                     self.progress_bar['value'] = message.get("value", 0)
                 elif msg_type == "error":
                     error_msg = message.get('message', 'Unknown error during scan')
                     self.status_label.config(text=f"Error: {error_msg}")
                     messagebox.showerror("Scan Error", error_msg, parent=self.root)
+                    # Error might occur *after* stop was requested, ensure UI resets
+                    if not self.stop_scan_event.is_set():
+                        self.set_ui_state('normal') # Ensure UI is re-enabled on error
+                    self.stop_button.config(state=tk.DISABLED) # Always disable stop on error
                 elif msg_type == "result":
-                    self.duplicates_data = message.get("data", {})
-                    self.populate_treeview() # Display the results
+                    # Only update results if scan wasn't stopped prematurely
+                    if not self.stop_scan_event.is_set():
+                        self.duplicates_data = message.get("data", {})
+                        self.populate_treeview() # Display the results
                 elif msg_type == "finished":
-                    self.set_ui_state('normal') # Re-enable UI controls
-                    # Enable action buttons only if duplicates were found
-                    action_state = tk.NORMAL if self.duplicates_data else tk.DISABLED
+                    self.set_ui_state('normal') # Re-enable UI controls, disable Stop button
+                    # Enable action buttons only if duplicates were found AND scan wasn't stopped
+                    action_state = tk.DISABLED
+                    if not self.stop_scan_event.is_set() and self.duplicates_data:
+                         action_state = tk.NORMAL
+
                     self.delete_button.config(state=action_state)
                     trash_state = action_state if SEND2TRASH_AVAILABLE else tk.DISABLED
                     self.trash_button.config(state=trash_state)
                     self.move_button.config(state=action_state)
-                    # Update status if not already showing an error or completion message
+
+                    # Update status if not already showing an error or stop message
                     current_status = self.status_label.cget("text")
-                    if not current_status.startswith("Error:") and "Scan complete" not in current_status: # noqa E701
-                         num_sets = len(self.duplicates_data)
-                         if num_sets > 0:
-                             num_files = sum(len(fps) for fps in self.duplicates_data.values())
-                             final_msg = f"Scan complete. Found {num_sets} duplicate set(s) involving {num_files} files." # noqa E701
-                         else:
-                             final_msg = "Scan complete. No duplicates found."
-                         self.status_label.config(text=final_msg)
-                    # Briefly show 100% progress then reset after a delay
-                    self.progress_bar['value'] = 100
-                    self.root.after(2500, lambda: self.progress_bar.config(value=0) if not self.scan_thread or not self.scan_thread.is_alive() else None) # noqa E701
+                    is_error = current_status.startswith("Error:")
+                    is_stopping = current_status == "Stopping scan..."
+                    is_stopped = current_status == "Scan stopped by user."
+
+                    if not is_error and not is_stopping and not is_stopped:
+                        if not self.stop_scan_event.is_set(): # Only show completion message if not stopped
+                             num_sets = len(self.duplicates_data)
+                             if num_sets > 0:
+                                 num_files = sum(len(fps) for fps in self.duplicates_data.values())
+                                 final_msg = f"Scan complete. Found {num_sets} duplicate set(s) involving {num_files} files." # noqa E701
+                             else:
+                                 final_msg = "Scan complete. No duplicates found."
+                             self.status_label.config(text=final_msg)
+                             # Briefly show 100% progress then reset after a delay
+                             self.progress_bar['value'] = 100
+                             self.root.after(2500, lambda: self.progress_bar.config(value=0) if not self.scan_thread or not self.scan_thread.is_alive() else None) # noqa E701
+                        # If it *was* stopped, the "Scan stopped..." message is already set by the thread or queue checker
+                    elif is_stopped:
+                        self.progress_bar['value'] = 0 # Reset progress bar on stop
 
         except queue.Empty:
             pass # No messages currently in the queue
@@ -429,6 +514,8 @@ class DuplicateFinderApp:
             # Catch errors in the queue processing itself
             print(f"Error processing queue message: {e}", file=sys.stderr)
             self.status_label.config(text="Error displaying results.")
+            self.set_ui_state('normal') # Ensure UI is usable after display error
+            self.stop_button.config(state=tk.DISABLED)
         finally:
             # Schedule the next check
             self.root.after(100, self.check_queue) # Check again in 100ms
@@ -485,7 +572,10 @@ class DuplicateFinderApp:
 
         # Update status if tree is now empty (e.g., after action cleared all)
         if not self.tree.get_children():
-            self.status_label.config(text="No duplicates found or list cleared.")
+            # Check if scan was stopped - if so, status is already set
+            current_status = self.status_label.cget("text")
+            if "stopped" not in current_status.lower() and "stopping" not in current_status.lower():
+                 self.status_label.config(text="No duplicates found or list cleared.")
 
 
     def get_selected_file_paths(self, show_warning=True):
@@ -520,7 +610,7 @@ class DuplicateFinderApp:
         if not file_paths and selected_items:
             # If items were selected but no paths were retrieved (e.g., mapping error)
              if show_warning:
-                messagebox.showinfo("No Files Selected", "Selected items are not valid file entries.", parent=self.root) # noqa E701
+                 messagebox.showinfo("No Files Selected", "Selected items are not valid file entries.", parent=self.root) # noqa E701
              return None
         return file_paths
 
@@ -559,7 +649,10 @@ class DuplicateFinderApp:
             trash_state = 'disabled' # Always disable if empty
             self.trash_button.config(state=trash_state)
             self.move_button.config(state='disabled')
-            self.status_label.config(text="List cleared or no duplicates remain.")
+            # Check if scan was stopped before overwriting status
+            current_status = self.status_label.cget("text")
+            if "stopped" not in current_status.lower() and "stopping" not in current_status.lower():
+                 self.status_label.config(text="List cleared or no duplicates remain.")
 
 
     # --- Action Methods (Delete, Trash, Move) ---
@@ -619,7 +712,7 @@ class DuplicateFinderApp:
         num_files = len(selected_files)
         # Optional: Add confirmation dialog for trashing
         # if not messagebox.askyesno("Confirm Trash", f"Move {num_files} selected file(s) to the Trash/Recycle Bin?", parent=self.root): # noqa E701
-        #    return
+        #     return
 
         processed_ids, errors = [], []
         self.status_label.config(text=f"Moving {num_files} file(s) to trash...")
@@ -680,9 +773,15 @@ class DuplicateFinderApp:
                 # Handle potential filename conflicts in the destination
                 while os.path.exists(dest_path):
                     # Check if source and destination are identical (avoid error)
-                    if os.path.samefile(normalized_path, dest_path):
-                         errors.append(f"Cannot move '{base_name}': source and destination are the same.") # noqa E701
-                         break # Exit inner loop for this file
+                    try:
+                        # Use try-except for samefile in case one vanishes
+                        if os.path.samefile(normalized_path, dest_path):
+                            errors.append(f"Cannot move '{base_name}': source and destination are the same.") # noqa E701
+                            break # Exit inner loop for this file
+                    except FileNotFoundError:
+                         errors.append(f"Cannot compare '{base_name}': source or destination file missing during check.")
+                         break # Exit inner loop
+
                     # Append counter to filename if conflict exists
                     name, ext = os.path.splitext(base_name)
                     dest_path = os.path.normpath(os.path.join(dest_folder, f"{name}_{counter}{ext}")) # noqa E701
@@ -732,7 +831,7 @@ class DuplicateFinderApp:
                     if not os.path.exists(normalized_path):
                         messagebox.showwarning("Open Error", f"File no longer exists at:\n{normalized_path}", parent=self.root) # noqa E701
                         # Optionally, remove the item from the tree if it doesn't exist
-                        # self.update_treeview_after_action([item_id])
+                        self.update_treeview_after_action([item_id])
                         return
 
                     # Platform-specific open command
@@ -744,12 +843,12 @@ class DuplicateFinderApp:
                         subprocess.run(['xdg-open', normalized_path], check=True)
 
                 except FileNotFoundError:
-                     # Handles os.startfile error if file vanished between check and open,
-                     # or xdg-open/open command not found
-                     messagebox.showerror("Open Error", f"Could not open file.\nFile not found or required system utility (like xdg-open or associated application) is missing:\n{normalized_path}", parent=self.root) # noqa E701
+                    # Handles os.startfile error if file vanished between check and open,
+                    # or xdg-open/open command not found
+                    messagebox.showerror("Open Error", f"Could not open file.\nFile not found or required system utility (like xdg-open or associated application) is missing:\n{normalized_path}", parent=self.root) # noqa E701
                 except subprocess.CalledProcessError as e:
-                     # Handles errors from 'open' or 'xdg-open' if they fail
-                     messagebox.showerror("Open Error", f"Failed to open file using system command:\n{normalized_path}\n\nError: {e}", parent=self.root) # noqa E701
+                    # Handles errors from 'open' or 'xdg-open' if they fail
+                    messagebox.showerror("Open Error", f"Failed to open file using system command:\n{normalized_path}\n\nError: {e}", parent=self.root) # noqa E701
                 except Exception as e:
                     # Catch any other unexpected errors
                     messagebox.showerror("Open Error", f"An unexpected error occurred trying to open:\n{normalized_path}\n\nError: {e}", parent=self.root) # noqa E701
@@ -976,8 +1075,8 @@ class DuplicateFinderApp:
             if path and column in ('#0', '#1'): # #0 is Tree, #1 is filepath
                  # Schedule _show_tooltip to run after TOOLTIP_DELAY ms
                  self.tooltip_after_id = self.root.after(
-                     TOOLTIP_DELAY,
-                     self._show_tooltip, event.x_root, event.y_root, path # Pass coords and path # noqa E701
+                      TOOLTIP_DELAY,
+                      self._show_tooltip, event.x_root, event.y_root, path # Pass coords and path # noqa E701
                  )
         else:
             # Don't show tooltip for set headers
@@ -1045,10 +1144,12 @@ class DuplicateFinderApp:
         text_widget.tag_configure("normal", font=("Arial", 10))
 
         # Content
-        today_date = datetime.date.today().strftime("%Y-%m-%d") # Get current date
+        # *** Change 18: Use fixed release date constant ***
+        #today_date = datetime.date.today().strftime("%Y-%m-%d") # Get current date
         app_name = "Duplicate File Finder"
         version_info = f"Version: {APP_VERSION}"
-        release_info = f"Release Date: {today_date}"
+        #release_info = f"Release Date: {today_date}"
+        release_info = f"Release Date: {APP_RELEASE_DATE}" # Use the constant
         author_info = "Author: Imam Wahyudi"
         github_url = "https://github.com/imamwahyudime"
         linkedin_url = "https://www.linkedin.com/in/imam-wahyudi/"
